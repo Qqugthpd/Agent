@@ -151,37 +151,39 @@ if uploaded_file is not None:
     logger = TraceLogger(output_path="trace_web.jsonl")
     logger.log_file_access(tmp_file_path)
 
-    with st.spinner(f"正在解析 {file_suffix} 文件（图片型 PDF 会自动启动 OCR，可能需要3-5分钟）..."):
+    with st.spinner(f"正在解析 {file_suffix} 文件（图片型 PDF 会自动启动 OCR，可能需要 3-5 分钟）..."):
         raw_text = extract_text_from_file(tmp_file_path)
 
     # 文本清洗
     raw_text = re.sub(r'\n+', '\n', raw_text)
     raw_text = re.sub(r' +', ' ', raw_text)
 
-    # 创建扁平化副本用于关键词查找
+    # 扁平化副本（去掉所有空白字符），用于关键词匹配
     flat_text = re.sub(r'\s+', '', raw_text)
 
-    # 关键词列表（简繁双覆盖 + 各类财报命名）
+    # 关键词列表（新增 OCR 常见误读变体 + 更多兜底词）
     possible_keywords = [
+        # A股/常见
         "主要会计数据",
         "财务摘要", "財務摘要",
-        "综合收益表", "綜合收益表",
-        "合并利润表", "合併利潤表",
-        "利润表", "利潤表",
+        # 港股/美股（简繁双覆盖 + OCR 误读变体）
+        "综合收益表", "綜合收益表", "合併經營狀況及綜合收益表", "合并经营状况及综合收益表",
+        "合并利润表", "合併利潤表", "利润表", "利潤表",
         "综合财务状况表", "綜合財務狀況表",
-        "合并资产负债表", "合併資產負債表",
-        "资产负债表", "資產負債表",
+        "合并资产负债表", "合併資產負債表", "合供資產負債表", "資產負債表", "资产负债表",
         "综合现金流量表", "綜合現金流量表",
         "合并现金流量表", "合併現金流量表",
         "现金流量表", "現金流量表",
-        "现金流量分析",
-        "经营活动产生的现金流量",
+        # 辅助章节
+        "现金流量分析", "经营活动产生的现金流量",
         "财务报表附注", "財務報表附註",
         "合并财务报表", "合併財務報表",
         "财务报表", "財務報表",
+        # 最后兜底（只匹配表名）
+        "收益表",
     ]
 
-    MAX_CHARS = 30000
+    MAX_CHARS = 50000
     financial_text = ""
     found_keyword = None
 
@@ -189,6 +191,7 @@ if uploaded_file is not None:
         flat_keyword = re.sub(r'\s+', '', keyword)
         if flat_keyword in flat_text:
             flat_idx = flat_text.find(flat_keyword)
+            # 映射回原始文本位置
             count = 0
             orig_idx = 0
             for i, ch in enumerate(raw_text):
@@ -204,8 +207,12 @@ if uploaded_file is not None:
             break
 
     if not found_keyword:
-        financial_text = raw_text[:MAX_CHARS]
-        st.warning(f"⚠️ 未识别到标准财报章节，已自动截取前 {MAX_CHARS} 个字符进行分析。")
+        # 兜底：同时截取前 MAX_CHARS 和后 MAX_CHARS 个字符
+        # 因为港股/美股财报的"主要财务数据"通常在开头，完整报表在末尾
+        head = raw_text[:MAX_CHARS]
+        tail = raw_text[-MAX_CHARS:]
+        financial_text = head + "\n\n=== （中间省略） ===\n\n" + tail
+        st.warning(f"⚠️ 未识别到标准财报章节，已自动截取前 {MAX_CHARS} 和后 {MAX_CHARS} 个字符进行分析。")
 
     query = f"""
 请分析以下上市公司财务报告片段，完成以下任务：
@@ -239,13 +246,9 @@ if uploaded_file is not None:
         st.success("分析完成！")
         report_text = result["final_answer"]
 
-        # ============ 优化后的指标提取（两层：报告优先，原文兜底） ============
+        # ============ 指标提取（两层：报告优先，原文兜底） ============
         def extract_metric(keyword, source_texts):
-            """
-            从多个来源（智能体报告 + 原始财报文本）提取指标。
-            source_texts 是个列表，按优先级排列。
-            """
-            # 每种指标对应的正则模式列表（从精确到宽泛）
+            """从多个来源（智能体报告 + 原始财报文本）提取指标"""
             if "现金流" in keyword:
                 patterns = [
                     r"经营活动产生的现金流量净额[^\d\-]*?([\d,]+\.?\d*)",
@@ -259,7 +262,7 @@ if uploaded_file is not None:
                     r"营业收入[^\d\-]*?([\d,]+\.?\d*)",
                     r"营业总收入[^\d\-]*?([\d,]+\.?\d*)",
                     r"\*{0,2}总收入\*{0,2}[：:]\s*([\d,]+\.?\d*)",
-                    r"(?:^|\n)\s*收入[^\d\-]*?([\d,]+\.?\d*)",
+                    r"(?:^|\n)\s*(?:收入|總收入)[^\d\-]*?([\d,]+\.?\d*)",
                 ]
             elif "净利润" in keyword:
                 patterns = [
@@ -273,7 +276,6 @@ if uploaded_file is not None:
             else:
                 patterns = [rf"{keyword}[^\d\-]*?([\d,]+\.?\d*)"]
 
-            # 遍历所有来源文本，依次尝试所有模式
             for source in source_texts:
                 if not source:
                     continue
@@ -282,10 +284,8 @@ if uploaded_file is not None:
                         val = match.group(1).strip().rstrip(".").rstrip(",")
                         try:
                             num = float(val.replace(",", ""))
-                            # 跳过年份
                             if 2020 <= num <= 2030 and "," not in val and "." not in val:
                                 continue
-                            # 跳过太小的值（可能是附注编号）
                             if num < 100:
                                 continue
                             return val
@@ -293,7 +293,6 @@ if uploaded_file is not None:
                             continue
             return "--"
 
-        # 优先从智能体报告提取，报告提取不到就从原始财报文本提取
         source_texts = [report_text, financial_text]
 
         st.markdown("### 📊 核心财务指标")
